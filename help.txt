@@ -1,0 +1,121 @@
+mage: keep Claude session contexts per git repo and branch, outside the repo
+
+START HERE
+  mage revive          (r)      THE command. Run it whenever you start Claude on a
+                                branch (new branch, coming back, fresh session):
+                                loads the branch's context, shows the status and
+                                copies the prompt for Claude to the clipboard.
+                                Then paste the prompt into a new Claude session.
+
+  That's usually all you need. On a new branch `mage r` offers to create its
+  chat. You don't need to save before switching branches: `mage r` on the next
+  branch saves the current context to its own chat first.
+
+  mage new [name]      (n)      Create a chat explicitly (default name: the branch)
+                                and load it, without being asked
+  mage jumpstart       (j)      A quiet revive: loads without asking anything and
+                                prints only the prompt (or only the error), never
+                                touching the clipboard. `mage j | pbcopy` copies it.
+
+HOW IT WORKS
+  A chat is a named set of versions, usually one chat per git branch. A version
+  is one snapshot of the chat's context file. The chat@version that is loaded
+  (e.g. main@v1) is called the context. It lives in the repo as
+  {CONTEXT_DIR}/CONTEXT.md (untracked); Claude reads and updates it. mage keeps
+  the stored copy safe under {MAGE_HOME}.
+
+USAGE
+  mage [command] [subcommand] [args] [--force] [--help]
+
+EVERYDAY
+  mage revive [chat]   (r)      load + status + message, and copy the prompt
+  mage jumpstart [chat] (j)     Quiet load, then only the prompt: no questions, no
+                                clipboard
+  mage new [name]      (n)      Create a chat (default: __branch) and load it; sets
+                                up the repo too, if needed
+  mage                          Show status: branch, loaded context, unsaved changes
+  mage status                   Same as above
+  mage save            (s)      Save CONTEXT.md to the loaded chat@version
+  mage message         (m)      Print the prompt for a new Claude session
+  mage help            (h)      Show this help
+
+MORE CONTROL
+  mage load [chat]     (l)      Save whatever is loaded, then load the chat (default:
+                                __branch) at its default version. Offers to create
+                                the branch's chat (and set up the repo) if missing.
+  mage quit            (q)      Save, then remove CONTEXT.md from the repo
+  mage discard         (d)      Remove CONTEXT.md WITHOUT saving (asks first; a copy
+                                goes to the trash)
+
+CHATS                  (c)
+  mage chat list       (c l)    List chats (* = loaded). `mage c` alone lists too.
+  mage chat switch     (c s)    [chat] [version]: save the current context and load
+                                another (defaults: __branch __default)
+  mage chat new        (c n)    [name]: same as `mage new`
+  mage chat delete     (c d)    <chat>: delete a chat and all its versions (to trash)
+
+VERSIONS               (v)      These act on the loaded chat, or else on the branch's chat
+  mage version list    (v l)    List versions (* = loaded). `mage v` alone lists too.
+  mage version switch  (v s)    [version]: save the current one and load another
+                                (default: __default)
+  mage version new     (v n)    [name]: create an empty version, make it the default
+                                and load it
+  mage version fork    (v f)    [name]: save, copy the current version into a new
+                                one, make it the default and load it (a backup
+                                before a risky change)
+  mage version pin     (v p)    <version>: make a version the default by hand
+  mage version delete  (v d)    <version>: delete a version (to trash)
+
+  Version names are optional. A version without one is called by its id, so
+  the first version of chat "main" is main@v1.
+
+REFERRING TO THINGS
+  Chats and versions can be named by name or by id (c1, v2).
+  __branch     the chat named after the current git branch
+  __default    the chat's default version: the one revive, jumpstart and load
+               pick. It's the newest version made with `version new` or `version
+               fork`, or one set with `version pin`. Loading or switching to
+               another version does not change it.
+
+OPTIONS
+  -f, --force  Skip confirmations and overwrite a stored version that was
+               changed elsewhere since it was loaded
+  -h, --help   Show this help
+
+TYPICAL WORKFLOW
+  git switch -c my-branch
+  mage r                        create the branch's chat; paste the prompt into Claude
+  ...work, ask Claude to update {CONTEXT_DIR}/CONTEXT.md...
+  mage s                        a checkpoint, whenever you like
+  git switch other-branch
+  mage r                        saves my-branch's context, loads other-branch's
+  git switch my-branch
+  mage r                        and back again
+
+SAFETY
+  - {CONTEXT_DIR}/current.json records which chat@version CONTEXT.md belongs to.
+    Saving always goes there, never to whatever branch you're on.
+  - If the stored version changed since you loaded it (e.g. another worktree),
+    saving stops unless you pass --force. revive and jumpstart stop too, and
+    print no prompt.
+  - Each save keeps the previous content as <vid>.md.bak in the store.
+  - Deleted and discarded files are moved to the trash in the repo's store
+    directory, never deleted for good.
+  - {CONTEXT_DIR}/ is added to .git/info/exclude, so it is never committed.
+
+SETUP (once)
+  mage install [bin-dir]        Symlink this script into bin-dir (default
+                                ~/.local/bin) and create {MAGE_HOME}
+  mage init            (i)      Set up this repo with a chat for the current branch
+                                (revive, jumpstart, load and new do this for you)
+
+FILES
+  {MAGE_HOME}/config.json                 settings: "message" replaces the prompt
+                                          ({file} and {context} are filled in)
+  {MAGE_HOME}/repos/<repo>-<hash>/        per-repo store: mage.json, chats/, trash/
+  <repo>/{CONTEXT_DIR}/CONTEXT.md         the loaded context (Claude edits this)
+  <repo>/{CONTEXT_DIR}/current.json       which chat@version is loaded
+  help.txt (next to the mage script)      this help
+
+ENVIRONMENT
+  MAGE_HOME    data directory (default ~/.mage)

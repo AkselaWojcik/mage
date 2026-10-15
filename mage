@@ -25,6 +25,8 @@
 #   - Saving refuses when the stored version changed since loading (--force overrides).
 #   - Every write is atomic (temp file + rename) and one command runs per repo at a time.
 #   - Nothing is deleted for good: removed and discarded files go to the trash.
+#
+# The help text is in help.txt, next to this script.
 
 require "digest"
 require "fileutils"
@@ -43,19 +45,27 @@ class Mage
   # command => one-letter shortcut (nil: no shortcut)
   TOP_COMMANDS = {
     "install" => nil, "init" => "i", "help" => "h", "status" => nil,
-    "load" => "l", "save" => "s", "exit" => "e", "discard" => "d", "message" => "m",
-    "chat" => "c", "version" => "v"
+    "revive" => "r", "jumpstart" => "j", "new" => "n", "load" => "l", "save" => "s", "quit" => "q", "discard" => "d",
+    "message" => "m", "chat" => "c", "version" => "v"
   }.freeze
-  CHAT_COMMANDS = { "list" => "l", "switch" => "s", "new" => "n", "remove" => "r" }.freeze
-  VERSION_COMMANDS = CHAT_COMMANDS.merge("copy" => "c", "default" => "d").freeze
+  CHAT_COMMANDS = { "list" => "l", "switch" => "s", "new" => "n", "delete" => "d" }.freeze
+  VERSION_COMMANDS = CHAT_COMMANDS.merge("fork" => "f", "pin" => "p").freeze
 
   DEFAULT_MESSAGE = <<~TEXT.strip
     Read {file} (in the repository root). It holds the context of my earlier work \
-    on this task. Read it carefully, then reply with a short \
-    summary of where we are and wait for my instructions. Do not edit files or run \
-    commands yet. Later, when I ask you to update the context, rewrite {file} so that \
-    a fresh session could continue from it with no other information.
+    on this task. This session is called {context} (chat@version); use that name \
+    whenever you refer to this session or its context. Read the file carefully, then \
+    reply with a short summary of where we are and wait for my instructions. Do not \
+    edit files or run commands yet. Later, when I ask you to update the context, \
+    rewrite {file} so that a fresh session could continue from it with no other information.
   TEXT
+
+  HELP_FILE = File.join(File.dirname(File.realpath(__FILE__)), "help.txt")
+
+  # Tried in order by `mage revive` to copy the prompt (macOS, Wayland, X11).
+  CLIPBOARD_TOOLS = [
+    %w[pbcopy], %w[wl-copy], %w[xclip -selection clipboard], %w[xsel --clipboard --input]
+  ].freeze
 
   def self.main(argv)
     new(argv).run
@@ -96,13 +106,16 @@ class Mage
   # ---------------------------------------------------------------------------
 
   def run_repo_command(command)
-    args(0) unless %w[chat version].include?(command) # these take no arguments
+    args(0) unless %w[revive jumpstart load new chat version].include?(command) # the rest take no arguments
     case command
     when "init" then init
     when "status" then status
-    when "load" then load_branch_chat
+    when "revive" then revive(*args(1))
+    when "jumpstart" then jumpstart(*args(1))
+    when "load" then load_chat(*args(1))
+    when "new" then new_chat(*args(1))
     when "save" then save
-    when "exit" then exit_context
+    when "quit" then quit
     when "discard" then discard
     when "message" then message
     when "chat" then chat_command(resolve_command(@args.shift, CHAT_COMMANDS, "mage chat") || "list")
@@ -118,15 +131,12 @@ class Mage
       name, version = args(2)
       cid = find_chat(name)
       switch_to(cid, find_version(cid, version))
-    when "new"
+    when "new" then new_chat(*args(1))
+    when "delete"
       name, = args(1)
-      cid, vid = create_chat(name == BRANCH ? branch : name)
-      switch_to(cid, vid)
-    when "remove"
-      name, = args(1)
-      raise MageError, "say which chat to remove: mage chat remove <name|cid>" unless name
+      raise MageError, "say which chat to delete: mage chat delete <name|cid>" unless name
 
-      chat_remove(find_chat(name))
+      chat_delete(find_chat(name))
     end
   end
 
@@ -141,21 +151,22 @@ class Mage
     when "new"
       name, = args(1)
       cid = current_chat
+      save_current! # fails on a conflict before anything is created
       switch_to(cid, create_version(cid, name, starter_content(meta["chats"][cid]["name"])))
-    when "copy"
+    when "fork"
       name, = args(1)
-      version_copy(current_chat, name)
-    when "default"
+      version_fork(current_chat, name)
+    when "pin"
       ref, = args(1)
-      raise MageError, "say which version: mage version default <name|vid>" unless ref
+      raise MageError, "say which version to pin: mage version pin <name|vid>" unless ref
 
-      version_set_default(current_chat, ref)
-    when "remove"
+      version_pin(current_chat, ref)
+    when "delete"
       ref, = args(1)
-      raise MageError, "say which version to remove: mage version remove <name|vid>" unless ref
+      raise MageError, "say which version to delete: mage version delete <name|vid>" unless ref
 
       cid = current_chat
-      version_remove(cid, find_version(cid, ref))
+      version_delete(cid, find_version(cid, ref))
     end
   end
 
@@ -205,6 +216,7 @@ class Mage
 
     puts "Installed: #{link} -> #{script}"
     puts "Data dir:  #{MAGE_HOME}"
+    warn "note: #{HELP_FILE} is missing, so `mage help` won't work; keep it next to the script" unless File.exist?(HELP_FILE)
     return if ENV["PATH"].to_s.split(":").map { |dir| File.expand_path(dir) }.include?(bin_dir)
 
     warn "note: #{bin_dir} is not in your PATH; add it to use `mage` directly"
@@ -216,14 +228,64 @@ class Mage
     if File.exist?(meta_path)
       puts "Repo already initialized (#{store_dir})"
     else
-      @meta = { "repo_path" => repo_root, "next_chat_id" => 1, "chats" => {} }
-      save_meta!
-      puts "Initialized repo store in #{store_dir}"
+      create_repo_store
     end
 
     name = branch
     raise MageError, "branch '#{name}' already has a chat; run `mage load` to load it" if chat_named(name)
 
+    new_chat(name)
+  end
+
+  # `mage revive`: everything needed to start a Claude session on this branch.
+  # Load, then show the status and the prompt, and copy the prompt to the
+  # clipboard. If loading fails (e.g. a conflict), it stops there, before
+  # printing or copying a prompt for the wrong context.
+  def revive(ref = nil)
+    load_chat(ref)
+    puts
+    status
+    puts
+    message
+    puts
+    puts(copy_to_clipboard(prompt_text) ? "(prompt copied to clipboard)" : "(no clipboard tool found; copy the prompt above)")
+  end
+
+  # `mage jumpstart`: a quiet revive. Never asks anything (the branch's chat is
+  # created if missing) and never touches the clipboard. It prints only the
+  # prompt when loading succeeded, or only the error when it didn't, so
+  # `mage jumpstart | pbcopy` copies exactly the prompt.
+  def jumpstart(ref = nil)
+    quietly { load_chat(ref, ask: false) }
+    message
+  end
+
+  # Saves whatever is loaded and loads the chat (default: the branch's chat)
+  # at its default version. Offers to set up the repo and create the branch's
+  # chat when missing (ask: false creates them without asking). A chat named
+  # explicitly is never created, so a typo can't make a stray chat.
+  def load_chat(ref = nil, ask: true)
+    from_branch = ref.nil? || ref == BRANCH
+    name = from_branch ? branch : ref
+    if from_branch && !File.exist?(meta_path)
+      confirm!("mage isn't set up for this repo yet. Set it up with a chat for '#{name}'?", default_yes: true) if ask
+      return init
+    end
+
+    cid = meta["chats"].key?(name) ? name : chat_named(name)
+    return switch_to(cid, find_version(cid, DEFAULT)) if cid
+    raise MageError, "no chat '#{name}' (see: mage chat list, or create it: mage new #{name})" unless from_branch
+
+    confirm!("Branch '#{name}' has no chat yet. Create it?", default_yes: true) if ask
+    new_chat(name)
+  end
+
+  # Creates a chat (default: named after the branch) and loads it.
+  # Sets up the repo first if needed: asking for a chat is explicit enough.
+  def new_chat(name = nil)
+    name = branch if name.nil? || name == BRANCH
+    create_repo_store unless File.exist?(meta_path)
+    save_current! # fails on a conflict before anything is created
     cid, vid = create_chat(name)
     switch_to(cid, vid)
   end
@@ -241,7 +303,7 @@ class Mage
     if ptr.nil?
       puts "context: none loaded"
       puts "warning: #{rel(context_file)} exists but isn't managed by mage" if has_file
-      puts(chat_named(current_branch) ? "hint:    run `mage load`" : "hint:    run `mage init`") unless has_file
+      puts "hint:    run `mage revive`" unless has_file
       return
     end
 
@@ -259,12 +321,6 @@ class Mage
     note_other_branch(ptr)
   end
 
-  # `mage load` == `mage chat switch __branch __default`
-  def load_branch_chat
-    cid = find_chat(BRANCH)
-    switch_to(cid, find_version(cid, DEFAULT))
-  end
-
   def save
     ptr = loaded_context or raise MageError, "nothing is loaded"
     note_other_branch(ptr)
@@ -272,7 +328,7 @@ class Mage
     puts(save_loaded(ptr) ? "Saved #{name}" : "No changes to save in #{name}")
   end
 
-  def exit_context
+  def quit
     ptr = loaded_context or raise MageError, "nothing is loaded"
     note_other_branch(ptr)
     name = label(ptr["chat"], ptr["version"])
@@ -298,9 +354,13 @@ class Mage
   end
 
   def message
+    puts prompt_text
+  end
+
+  def prompt_text
     ptr = loaded_context or raise MageError, "nothing is loaded; run `mage load` first"
     template = config.fetch("message", DEFAULT_MESSAGE)
-    puts template.gsub("{file}", rel(context_file)).gsub("{context}", label(ptr["chat"], ptr["version"]))
+    template.gsub("{file}", rel(context_file)).gsub("{context}", label(ptr["chat"], ptr["version"]))
   end
 
   # ---------------------------------------------------------------------------
@@ -309,21 +369,19 @@ class Mage
 
   def chat_list
     chats = meta["chats"]
-    return puts("No chats yet (create one: mage init, or mage chat new <name>)") if chats.empty?
+    return puts("No chats yet (create one: mage load, or mage new <name>)") if chats.empty?
 
     loaded = pointer&.fetch("chat")
     rows = chats.map do |cid, chat|
-      default = chat["default"]
-      [loaded == cid ? "*" : " ", cid, chat["name"], chat["versions"].size.to_s,
-       "#{default} (#{chat.dig('versions', default, 'name')})"]
+      [loaded == cid ? "*" : " ", cid, chat["name"], chat["versions"].size.to_s, label(cid, chat["default"])]
     end
     print_table(["", "ID", "NAME", "VERSIONS", "DEFAULT"], rows)
   end
 
-  def chat_remove(cid)
+  def chat_delete(cid)
     chat = meta["chats"][cid]
     ensure_not_loaded!(cid)
-    confirm!("Remove chat '#{chat['name']}' and its #{chat['versions'].size} version(s)?")
+    confirm!("Delete chat '#{chat['name']}' and its #{chat['versions'].size} version(s)?")
 
     # Update metadata first: a crash afterwards only leaves an orphan
     # directory, never metadata pointing at missing files.
@@ -331,7 +389,7 @@ class Mage
     save_meta!
     trashed = move_to_trash(File.join(store_dir, "chats", cid), "chat-#{slug(chat['name'])}")
     atomic_write(File.join(trashed, "chat.json"), JSON.pretty_generate(cid => chat) + "\n")
-    puts "Removed chat '#{chat['name']}' (moved to #{trashed})"
+    puts "Deleted chat '#{chat['name']}' (moved to #{trashed})"
   end
 
   def version_list(cid)
@@ -340,7 +398,7 @@ class Mage
     puts "Chat '#{chat['name']}' [#{cid}]"
     rows = chat["versions"].map do |vid, version|
       is_loaded = loaded && loaded["chat"] == cid && loaded["version"] == vid
-      [is_loaded ? "*" : " ", vid, version["name"], Time.parse(version["created_at"]).strftime("%Y-%m-%d %H:%M"),
+      [is_loaded ? "*" : " ", vid, version["name"] == vid ? "" : version["name"], Time.parse(version["created_at"]).strftime("%Y-%m-%d %H:%M"),
        chat["default"] == vid ? "default" : ""]
     end
     print_table(["", "ID", "NAME", "CREATED", ""], rows)
@@ -348,36 +406,33 @@ class Mage
 
   # Copies the current version (with unsaved changes saved first) into a new
   # version and switches to it. Handy as a backup before big changes.
-  def version_copy(cid, name)
-    ptr = loaded_context
-    if ptr
-      save_loaded(ptr)
-      source = ptr["version"]
-    else
-      source = find_version(cid, DEFAULT)
-    end
+  def version_fork(cid, name)
+    ptr = save_current!
+    source = ptr ? ptr["version"] : find_version(cid, DEFAULT)
     vid = create_version(cid, name, File.binread(version_path(cid, source)))
-    puts "Copied #{label(cid, source)} to #{label(cid, vid)}"
+    puts "Forked #{label(cid, source)} into #{label(cid, vid)}"
     switch_to(cid, vid)
   end
 
-  def version_set_default(cid, ref)
+  # Makes a version the chat's default by hand: the one `load`, `revive` and
+  # `jumpstart` pick. (New and forked versions become the default on their own.)
+  def version_pin(cid, ref)
     vid = find_version(cid, ref)
     meta["chats"][cid]["default"] = vid
     save_meta!
-    puts "Default version of '#{meta['chats'][cid]['name']}' is now #{label(cid, vid)}"
+    puts "Pinned #{label(cid, vid)}: it's now the default that `mage load` picks"
   end
 
-  def version_remove(cid, vid)
+  def version_delete(cid, vid)
     chat = meta["chats"][cid]
     ptr = pointer
     if ptr && ptr["chat"] == cid && ptr["version"] == vid
-      raise MageError, "#{label(cid, vid)} is loaded; switch to another version or `mage exit` first"
+      raise MageError, "#{label(cid, vid)} is loaded; switch to another version or `mage quit` first"
     end
-    raise MageError, "can't remove the only version of a chat; remove the chat instead" if chat["versions"].size == 1
+    raise MageError, "can't delete the only version of a chat; delete the chat instead" if chat["versions"].size == 1
 
     name = label(cid, vid)
-    confirm!("Remove version #{name}?")
+    confirm!("Delete version #{name}?")
     chat["versions"].delete(vid)
     chat["default"] = chat["versions"].keys.max_by { |id| id.delete_prefix("v").to_i } if chat["default"] == vid
     save_meta!
@@ -385,7 +440,7 @@ class Mage
     path = version_path(cid, vid)
     trashed = move_to_trash(path, "version-#{slug(name)}")
     FileUtils.mv("#{path}.bak", trashed) if File.exist?("#{path}.bak")
-    puts "Removed #{name} (moved to #{trashed})"
+    puts "Deleted #{name} (moved to #{trashed})"
   end
 
   # ---------------------------------------------------------------------------
@@ -411,8 +466,6 @@ class Mage
     atomic_write(context_file, content)
     write_pointer(cid, vid, digest(content))
 
-    meta["chats"][cid]["default"] = vid
-    save_meta!
     puts "Loaded #{label(cid, vid)} into #{rel(context_file)}"
   end
 
@@ -443,6 +496,13 @@ class Mage
     atomic_write(path, content)
     write_pointer(cid, vid, digest(content))
     true
+  end
+
+  # Saves the loaded context, if any, and returns its pointer (or nil).
+  def save_current!
+    ptr = loaded_context
+    save_loaded(ptr) if ptr
+    ptr
   end
 
   # Returns the pointer of the loaded context, nil when nothing is loaded,
@@ -479,7 +539,7 @@ class Mage
     ptr = pointer
     return unless ptr && ptr["chat"] == cid
 
-    raise MageError, "chat '#{meta['chats'][cid]['name']}' is loaded; switch to another chat or `mage exit` first"
+    raise MageError, "chat '#{meta['chats'][cid]['name']}' is loaded; switch to another chat or `mage quit` first"
   end
 
   def note_other_branch(ptr)
@@ -506,32 +566,43 @@ class Mage
     atomic_write(meta_path, JSON.pretty_generate(meta) + "\n")
   end
 
+  def create_repo_store
+    @meta = { "repo_path" => repo_root, "next_chat_id" => 1, "chats" => {} }
+    save_meta!
+    puts "Initialized repo store in #{store_dir}"
+  end
+
   def create_chat(name)
     validate_name!(name, "chat")
-    raise MageError, "chat '#{name}' already exists" if chat_named(name)
+    raise MageError, "chat '#{name}' already exists (load it: mage load #{name})" if chat_named(name)
 
     cid = "c#{meta['next_chat_id']}"
     meta["next_chat_id"] += 1
     meta["chats"][cid] = {
       "name" => name, "default" => nil, "next_version_id" => 1, "versions" => {}, "created_at" => now
     }
-    vid = create_version(cid, "initial", starter_content(name)) # also saves metadata
+    vid = create_version(cid, nil, starter_content(name)) # also saves metadata
     puts "Created chat '#{name}' [#{cid}]"
     [cid, vid]
   end
 
+  # A version without a name is named after its id, so labels read "main@v1".
   def create_version(cid, name, content)
-    validate_name!(name, "version")
     chat = meta["chats"][cid]
-    raise MageError, "chat '#{chat['name']}' already has a version '#{name}'" if chat["versions"].any? { |_, v| v["name"] == name }
-
     vid = "v#{chat['next_version_id']}"
+    if name
+      validate_name!(name, "version")
+      raise MageError, "chat '#{chat['name']}' already has a version '#{name}'" if chat["versions"].any? { |_, v| v["name"] == name }
+    else
+      name = vid
+    end
+
     chat["next_version_id"] += 1
     # Write the file before the metadata: a crash in between only leaves an
     # orphan file, never metadata pointing at a missing file.
     atomic_write(version_path(cid, vid), content)
     chat["versions"][vid] = { "name" => name, "created_at" => now }
-    chat["default"] ||= vid
+    chat["default"] = vid # new and forked versions become the default
     save_meta!
     vid
   end
@@ -544,7 +615,7 @@ class Mage
 
     cid = chat_named(ref)
     return cid if cid
-    raise MageError, "branch '#{ref}' has no chat yet; run `mage init` to create it" if from_branch
+    raise MageError, "branch '#{ref}' has no chat yet; run `mage load` to create it" if from_branch
 
     raise MageError, "no chat '#{ref}' (see: mage chat list)"
   end
@@ -595,14 +666,37 @@ class Mage
   # Paths, git and the file system
   # ---------------------------------------------------------------------------
 
-  def config_path = File.join(MAGE_HOME, "config.json")
-  def repo_key = "#{File.basename(repo_root)}-#{Digest::SHA256.hexdigest(repo_root)[0, 8]}"
-  def store_dir = File.join(MAGE_HOME, "repos", repo_key)
-  def meta_path = File.join(store_dir, "mage.json")
-  def version_path(cid, vid) = File.join(store_dir, "chats", cid, "#{vid}.md")
-  def context_dir = File.join(repo_root, CONTEXT_DIR)
-  def context_file = File.join(context_dir, "CONTEXT.md")
-  def pointer_file = File.join(context_dir, "current.json")
+  def config_path
+    File.join(MAGE_HOME, "config.json")
+  end
+
+  def repo_key
+    "#{File.basename(repo_root)}-#{Digest::SHA256.hexdigest(repo_root)[0, 8]}"
+  end
+
+  def store_dir
+    File.join(MAGE_HOME, "repos", repo_key)
+  end
+
+  def meta_path
+    File.join(store_dir, "mage.json")
+  end
+
+  def version_path(cid, vid)
+    File.join(store_dir, "chats", cid, "#{vid}.md")
+  end
+
+  def context_dir
+    File.join(repo_root, CONTEXT_DIR)
+  end
+
+  def context_file
+    File.join(context_dir, "CONTEXT.md")
+  end
+
+  def pointer_file
+    File.join(context_dir, "current.json")
+  end
 
   def require_installed!
     raise MageError, "mage is not installed; run `mage install`" unless File.exist?(config_path)
@@ -684,18 +778,56 @@ class Mage
     dir
   end
 
-  def confirm!(question)
+  # Runs the block with normal output discarded. Errors still reach the user,
+  # since they are raised and printed by Mage.main.
+  def quietly
+    stdout = $stdout
+    File.open(File::NULL, "w") do |null|
+      $stdout = null
+      yield
+    end
+  ensure
+    $stdout = stdout
+  end
+
+  # Copies text with the first clipboard tool found (macOS, Wayland, X11).
+  # Returns false instead of failing, since the clipboard is only a convenience.
+  def copy_to_clipboard(text)
+    tool = CLIPBOARD_TOOLS.find { |cmd| system("command -v #{cmd.first} >/dev/null 2>&1") }
+    return false unless tool
+
+    IO.popen(tool, "w", err: File::NULL) { |io| io.write(text) }
+    $?.success?
+  rescue SystemCallError
+    false
+  end
+
+  def confirm!(question, default_yes: false)
     return if @force
     raise MageError, "#{question} Re-run with --force to confirm" unless $stdin.tty?
 
-    print "#{question} [y/N] "
-    raise MageError, "aborted" unless %w[y yes].include?($stdin.gets.to_s.strip.downcase)
+    print "#{question} #{default_yes ? '[Y/n]' : '[y/N]'} "
+    answer = $stdin.gets.to_s.strip.downcase
+    return if %w[y yes].include?(answer) || (default_yes && answer.empty?)
+
+    raise MageError, "aborted"
   end
 
-  def digest(content) = Digest::SHA256.hexdigest(content)
-  def now = Time.now.iso8601
-  def rel(path) = path.delete_prefix("#{repo_root}/")
-  def slug(text) = text.gsub(/[^\w.@-]+/, "_")
+  def digest(content)
+    Digest::SHA256.hexdigest(content)
+  end
+
+  def now
+    Time.now.iso8601
+  end
+
+  def rel(path)
+    path.delete_prefix("#{repo_root}/")
+  end
+
+  def slug(text)
+    text.gsub(/[^\w.@-]+/, "_")
+  end
 
   def print_table(header, rows)
     widths = header.each_index.map { |i| [header, *rows].map { |row| row[i].to_s.length }.max }
@@ -708,99 +840,12 @@ class Mage
   # Help
   # ---------------------------------------------------------------------------
 
+  # The help text lives in help.txt next to the script (found through the
+  # install symlink). {MAGE_HOME} and {CONTEXT_DIR} are filled in.
   def help_text
-    <<~HELP
-      mage: keep Claude session contexts per git repo and branch, outside the repo
+    raise MageError, "help file not found: #{HELP_FILE} (keep help.txt next to the script)" unless File.exist?(HELP_FILE)
 
-      A chat is a named set of versions, usually one chat per git branch. A
-      version is one snapshot of the chat's context file. The chat@version that
-      is currently loaded is called the context. It lives in the repo as
-      #{CONTEXT_DIR}/CONTEXT.md (untracked) and is stored safely under #{MAGE_HOME}.
-
-      USAGE
-        mage [command] [subcommand] [args] [--force] [--help]
-
-      SETUP
-        mage install [bin-dir]       One-time global setup: symlinks this script into
-                                     bin-dir (default ~/.local/bin) and creates #{MAGE_HOME}
-        mage init           (i)      Set up this repo and create + load a chat for the
-                                     current branch (errors if the branch has one)
-
-      DAILY USE
-        mage                         Show status: branch, loaded context, unsaved changes
-        mage status                  Same as above
-        mage load           (l)      Load the current branch's chat at its default version.
-                                     Anything already loaded is saved first.
-        mage save           (s)      Save CONTEXT.md to the loaded chat@version
-        mage exit           (e)      Save, then remove CONTEXT.md from the repo
-        mage discard        (d)      Remove CONTEXT.md WITHOUT saving (asks first; a copy
-                                     goes to the trash)
-        mage message        (m)      Print the prompt that starts a new Claude session
-                                     from the context (try: mage m | pbcopy)
-        mage help           (h)      Show this help
-
-      CHATS                 (c)
-        mage chat list      (c l)    List chats (* = loaded). `mage c` alone lists too.
-        mage chat switch    (c s)    [chat] [version]: save the current context, load
-                                     another (defaults: __branch __default)
-        mage chat new       (c n)    <name>: create a chat with an empty version, load it
-        mage chat remove    (c r)    <chat>: remove a chat and all its versions (to trash)
-
-      VERSIONS              (v)      These act on the loaded chat, or else on the branch's chat
-        mage version list   (v l)    List versions (* = loaded). `mage v` alone lists too.
-        mage version switch (v s)    [version]: save the current one, load another
-                                     (default: __default)
-        mage version new    (v n)    <name>: create an empty version and load it
-        mage version copy   (v c)    <name>: save, copy the current version to a new one,
-                                     and load the copy (handy as a backup)
-        mage version default (v d)   <version>: set which version `load` picks
-        mage version remove (v r)    <version>: remove a version (to trash)
-
-      REFERRING TO THINGS
-        Chats and versions can be named by name or by id (c1, v2).
-        __branch     the chat named after the current git branch
-        __default    the chat's default version. It's set automatically to whatever
-                     you last loaded, or by hand with `mage version default`.
-
-      OPTIONS
-        -f, --force  Skip confirmations and overwrite a stored version that was
-                     changed elsewhere since it was loaded
-        -h, --help   Show this help
-
-      TYPICAL WORKFLOW
-        mage init                    first time on a new branch
-        mage load                    coming back to a branch
-        mage m | pbcopy              paste into a new Claude session
-        ...work, ask Claude to update #{CONTEXT_DIR}/CONTEXT.md...
-        mage save                    whenever you want a checkpoint
-        mage v c before-refactor     snapshot before a risky change
-        mage exit                    before committing or switching branches
-
-        If you switch branches without `mage exit`, nothing is lost: the context
-        still knows which chat it belongs to, and `mage load` on the new branch
-        saves it there before loading the branch's chat.
-
-      SAFETY
-        - #{CONTEXT_DIR}/current.json records which chat@version CONTEXT.md belongs to.
-          Saving always goes there, never to whatever branch you're on.
-        - If the stored version changed since you loaded it (e.g. another worktree),
-          saving stops unless you pass --force.
-        - Each save keeps the previous content as <vid>.md.bak in the store.
-        - Removed and discarded files are moved to the trash in the repo's store
-          directory, never deleted.
-        - #{CONTEXT_DIR}/ is added to .git/info/exclude, so it is never committed.
-
-      FILES
-        #{MAGE_HOME}/config.json                 settings; set "message" to replace the
-                                                 prompt from `mage message` ({file} and
-                                                 {context} are filled in)
-        #{MAGE_HOME}/repos/<repo>-<hash>/         per-repo store: mage.json, chats/, trash/
-        <repo>/#{CONTEXT_DIR}/CONTEXT.md          the loaded context (Claude edits this)
-        <repo>/#{CONTEXT_DIR}/current.json        which chat@version is loaded
-
-      ENVIRONMENT
-        MAGE_HOME    data directory (default ~/.mage)
-    HELP
+    File.read(HELP_FILE).gsub("{MAGE_HOME}", MAGE_HOME).gsub("{CONTEXT_DIR}", CONTEXT_DIR)
   end
 end
 
